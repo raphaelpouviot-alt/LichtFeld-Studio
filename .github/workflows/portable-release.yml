@@ -1,0 +1,299 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Portable Windows build for LichtFeld Studio.
+#
+# Produces a self-contained dist/ folder (CUDA runtime bundled), zips it, and
+# publishes it as a PUBLIC GitHub Release on THIS repository, so that
+# LichtFeld-Studio-Setup.exe can download it on any Windows machine.
+#
+# Upstream's own nightly.yml pushes packages to a private Cloudflare R2 bucket
+# (paid portal). This workflow keeps the exact same build recipe but publishes
+# to GitHub Releases instead. Source stays public, so GPLv3 redistribution is fine.
+#
+# Run it from the Actions tab -> "Portable Windows Release" -> "Run workflow".
+
+name: Portable Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        required: false
+        default: master
+      release_tag:
+        description: Release tag to publish (leave empty for portable-YYYYMMDD-<sha>)
+        required: false
+        default: ''
+      prerelease:
+        description: Mark the release as a pre-release
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'portable-v*'
+
+permissions:
+  contents: write
+
+env:
+  VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
+  VCPKG_BUILD_TYPE: release
+  CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+  BUILD_DIR: b
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      # windows-2022 runners ship with ~25 GB free. CUDA + vcpkg + LibTorch need
+      # more than that, so drop the preinstalled SDKs we will never use.
+      - name: Free disk space
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          $before = (Get-PSDrive C).Free / 1GB
+          foreach ($path in @(
+            'C:\Program Files\dotnet\sdk',
+            'C:\Program Files (x86)\Android',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server',
+            'C:\Program Files\Google\Chrome\Application\SetupMetrics',
+            'C:\npm\prefix'
+          )) {
+            if (Test-Path $path) { Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue }
+          }
+          $after = (Get-PSDrive C).Free / 1GB
+          Write-Host ("Free space: {0:N1} GB -> {1:N1} GB" -f $before, $after)
+
+      - name: Install CUDA 12.8 toolkit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cd ..
+          Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe -OutFile cuda.exe -Verbose
+          Start-Process -FilePath .\cuda.exe -ArgumentList "-y -s -accepteula -toolkit -override -noDisplayDriver" -Wait
+          Remove-Item .\cuda.exe -Force
+
+      - name: Set CUDA environment
+        shell: pwsh
+        run: |
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # Upstream hardcodes the VS 2022 Enterprise path. vswhere survives a runner
+      # image change (windows-2022 -> windows-2025) and a Community/Pro install.
+      - name: Locate MSVC toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found on this runner image." }
+          $root = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $root) { throw "No MSVC x64 toolset found on this runner image." }
+          $vcvars = Join-Path $root 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $root" }
+          Write-Host "Using $vcvars"
+          "VCVARS=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache vcpkg tool
+        id: cache-vcpkg-tool
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tool-${{ runner.os }}-2026-03-12
+          restore-keys: vcpkg-tool-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        if: steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cd ..
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Cache vcpkg_installed
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUILD_DIR }}/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-portable-v1-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/overlays/**') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-portable-v1-
+
+      # Same flags as upstream nightly.yml: BUILD_PORTABLE bundles the CUDA
+      # runtime into dist/, so the target machine only needs an NVIDIA driver.
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = $env:BUILD_DIR
+          $cmakeArgs = "-B $buildDir -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF"
+          $retryablePatterns = @(
+            'status code 5\d\d', 'timed out', 'timeout', 'connection reset',
+            'failed to connect', 'temporarily unavailable', 'tls', 'ssl'
+          )
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Configure attempt $attempt/3"
+            cmd /c "call `"$env:VCVARS`" && cmake $cmakeArgs"
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+
+            $shouldRetry = $false
+            $manifestLog = Join-Path $buildDir 'vcpkg-manifest-install.log'
+            if (Test-Path $manifestLog) {
+              foreach ($pattern in $retryablePatterns) {
+                if (Select-String -Path $manifestLog -Pattern $pattern -Quiet) { $shouldRetry = $true; break }
+              }
+            }
+            if (-not $shouldRetry -or $attempt -eq 3) { exit $LASTEXITCODE }
+
+            Write-Warning "Retryable configure failure, cleaning build tree before retry."
+            if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+            Start-Sleep -Seconds (15 * $attempt)
+          }
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake --build %BUILD_DIR% -j %NUMBER_OF_PROCESSORS%
+
+      - name: Package portable dist
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $stamp = Get-Date -Format 'yyyyMMdd'
+
+          $tag = "${{ github.event.inputs.release_tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            if ("${{ github.ref_type }}" -eq 'tag') { $tag = "${{ github.ref_name }}" }
+            else { $tag = "portable-$stamp-$shortSha" }
+          }
+
+          $packageName = "LichtFeld-Studio-windows-portable-$tag.zip"
+
+          cmake --install $env:BUILD_DIR --prefix dist
+          if (-not (Test-Path 'dist\bin\LichtFeld-Studio.exe')) {
+            throw "Portable install did not produce dist\bin\LichtFeld-Studio.exe"
+          }
+
+          Compress-Archive -Path dist\* -DestinationPath $packageName -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $packageName).Hash.ToLowerInvariant()
+          Set-Content -Path "$packageName.sha256" -Value "$hash  $packageName" -Encoding ascii
+
+          $sizeMb = [math]::Round((Get-Item $packageName).Length / 1MB, 1)
+          Write-Host "Package: $packageName ($sizeMb MB), sha256 $hash"
+
+          "tag=$tag"                   >> $env:GITHUB_OUTPUT
+          "package_name=$packageName"  >> $env:GITHUB_OUTPUT
+          "sha256=$hash"               >> $env:GITHUB_OUTPUT
+          "size_mb=$sizeMb"            >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha"        >> $env:GITHUB_OUTPUT
+
+      - name: Dump failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          foreach ($path in @(
+            "$env:BUILD_DIR\vcpkg-manifest-install.log",
+            "$env:BUILD_DIR\vcpkg_installed\vcpkg\issue_body.md",
+            "$env:BUILD_DIR\CMakeFiles\CMakeConfigureLog.yaml",
+            "$env:BUILD_DIR\CMakeFiles\CMakeError.log",
+            "$env:BUILD_DIR\CMakeCache.txt"
+          )) {
+            if (Test-Path $path) {
+              Write-Host "::group::$path"; Get-Content $path -Tail 400; Write-Host "::endgroup::"
+            }
+          }
+
+      # The installer reads the release by tag and picks the .zip asset.
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          PACKAGE: ${{ steps.package.outputs.package_name }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          SIZE_MB: ${{ steps.package.outputs.size_mb }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tick = [char]0x60
+
+          # Built line by line: a here-string would treat backticks as escapes.
+          $lines = @(
+            'Portable Windows build of LichtFeld Studio.'
+            ''
+            '| | |'
+            '|---|---|'
+            "| Commit | $tick${{ github.sha }}$tick |"
+            "| Built | $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC |"
+            "| Size | $env:SIZE_MB MB |"
+            "| SHA-256 | $tick$env:SHA256$tick |"
+            ''
+            'Self-contained: the CUDA runtime is bundled. The target machine needs an'
+            'NVIDIA GPU with compute capability 7.5+ (GTX 16-series / RTX 20-series and'
+            'newer) and driver 570 or newer. Nothing else to install.'
+            ''
+            "Install with $tick" + "LichtFeld-Studio-Setup.exe$tick, or unzip and run $tick" + "bin\LichtFeld-Studio.exe$tick."
+            ''
+            'Built from source under GPL-3.0-or-later. Source: this repository at the commit above.'
+          )
+          $notesFile = 'release-notes.md'
+          Set-Content -Path $notesFile -Value $lines -Encoding utf8
+
+          $checksum = "$env:PACKAGE.sha256"
+
+          gh release view $env:TAG 2>&1 | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+
+          if ($exists) {
+            Write-Host "Release $env:TAG already exists, replacing its assets."
+            gh release upload $env:TAG $env:PACKAGE $checksum --clobber
+          } else {
+            $ghArgs = @('release', 'create', $env:TAG, $env:PACKAGE, $checksum,
+                        '--title', "LichtFeld Studio portable $env:TAG",
+                        '--notes-file', $notesFile)
+            if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+            gh @ghArgs
+          }
+
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
+
+      - name: Summary
+        if: success()
+        shell: pwsh
+        run: |
+          $tick = [char]0x60
+          @(
+            '### Portable package published'
+            ''
+            "- Tag: $tick${{ steps.package.outputs.tag }}$tick"
+            "- Asset: $tick${{ steps.package.outputs.package_name }}$tick (${{ steps.package.outputs.size_mb }} MB)"
+            "- SHA-256: $tick${{ steps.package.outputs.sha256 }}$tick"
+            ''
+            'The installer picks this up automatically on its next run.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
